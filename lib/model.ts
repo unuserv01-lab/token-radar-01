@@ -11,51 +11,83 @@
 //
 // This radar ports that engine to a sealed DefiLlama snapshot. A protocol is the "signal" and
 // the snapshot's own figures are the evidence. No protocol name is ever special-cased; the
-// same four components score every row, and the mapping is:
+// same components score every row.
 //
-//   SOURCE_QUALITY    (w 0.30)  Record completeness, Bayesian-style prior.
-//     V6 gives each source a prior (Nansen 0.85, Forta 0.70, GMGN 0.65, Dune/Rugcheck 0.60,
-//     Birdeye 0.55). Here the "source" is the snapshot record itself: a complete record is a
-//     trustworthy source, a thin one is not. Base 0.55 (Birdeye's prior) + 0.15 for a listed
-//     date with at least 180 days of track record + 0.10 for a sane reported 7-day change
-//     (|change| <= 200%; a 4,000% print is noise, not evidence) + 0.10 for a named category
-//     + 0.10 for three or more chains, clamped to [0, 1]. A field counts only when it is
-//     informative: merely present is not evidence.
+// --- What changed in radar-v6-2, and why (audit fixes, 2026-11-16) -------------------------
 //
-//   WALLET_REPUTATION (w 0.25)  Protocol reputation, standing in for V6's wallet score
-//     (win_rate*0.40 + payoff*0.25 + sample*0.20 + consistency*0.15). A protocol that has
-//     held large TVL for a long time has "won" repeatedly; a young, small one has no track
-//     record. Half maturity (age capped at 1095 days, unknown age = 365 days) and half
-//     scale (log TVL between the $5M snapshot floor and the largest protocol), each in [0,1].
+// 1. CROSS_VALIDATION is 0. The snapshot is one sealed cross-section: its four "independent"
+//    fields (listed date, 7-day change, category, chain count) are the SAME fields that feed
+//    SOURCE_QUALITY, so counting them again as "independent confirmation" double-counts the
+//    evidence and inflates every complete record. Until an outside source confirms a protocol,
+//    cross-validation is 0. The weight it held (0.25) is redistributed over the three
+//    components the snapshot can actually measure, so the weights still sum to 1 and the
+//    0.45 / 0.75 tier thresholds keep their meaning:
+//        SOURCE_QUALITY  0.30 -> 0.40,  MATURITY_SCALE 0.25 -> 1/3,  SIGNAL_STRENGTH 0.20 -> 4/15.
+//    Without the redistribution, PRIORITY (score >= 0.75) would be unreachable: the three
+//    remaining components could sum to at most 0.75 even at a perfect record.
 //
-//   SIGNAL_STRENGTH   (w 0.20)  Momentum, standing in for V6's raw-signal extremity.
-//     V6's DEX scanner fires DEX_VOLUME_SPIKE at >= 4x the 60-point baseline. Here the
-//     spike is the 7-day TVL change, clamped to [-60, +120] per cent and mapped linearly
-//     onto [0, 1]. A change of +120% or more is a full-strength spike; -60% or worse is
-//     silence. The raw change is kept beside the score so the page can show it.
+// 2. WALLET_REPUTATION is renamed MATURITY_SCALE. It never measured a wallet: it is half
+//    maturity (age capped at 1095 days) and half scale (log TVL from the $5M floor). The
+//    board.json key is renamed too (v6.maturity_scale); it is an extra key, not one the kit
+//    requires, so the rename is safe. The old name double-counted scale, which SIGNAL_STRENGTH
+//    already uses through the TVL change.
 //
-//   CROSS_VALIDATION  (w 0.25)  Independent confirmation, V6's own step function:
-//     1 source = 0.0, 2 sources = 0.6, 3+ sources = 1.0. The independent "sources" here
-//     are four separate fields of the record, each counted only when informative: a listed
-//     date with at least 180 days behind it, a sane 7-day change (|change| <= 200%), a
-//     named category, and deployment on three or more chains. A protocol confirmed by three
-//     or more of them scores 1.0; one confirmed by a single field scores 0.0.
+// 3. The implied value is fitted on comps, not on a guessed multiple. The old model used
+//    tvl x 0.25 — a round number with no basis. A log-log fit of market cap on TVL across the
+//    128 live-token protocols in THIS snapshot gives
+//        ln(mcap) = 6.9646 + 0.5223 * ln(tvl)     (R2 = 0.19, n = 128)
+//    so the value anchor is compsValue = exp(6.9646) * tvl^0.5223, i.e. a multiple that falls
+//    smoothly with size (0.67x at $5M TVL, 0.29x at $28M, 0.13x at $154M, 0.05x at $1B,
+//    0.018x at $10B) — the same pattern the banded medians show (0.42x / 0.17x / 0.08x /
+//    0.03x across the four TVL bands). Leave-one-out validation: median error 3.40x, against
+//    4.91x for the old flat 0.25 — better, but still wide, so the fit anchors the LEVEL and
+//    never pretends to price one protocol precisely. The multiple is clamped to [0.01, 1.0]
+//    as a guard for the largest protocols. tools/fit-comps.mjs reproduces the fit from any
+//    snapshot; CALIBRATION.md records the numbers and the rejected alternatives:
+//      - a 4-variable fit (adding growth and age) was REJECTED: its growth coefficient came
+//        out at -3.79 — high-growth live tokens are small caps that pumped — which would
+//        punish exactly the momentum a radar should reward. Growth and age enter through the
+//        model's own multipliers instead, where their direction is stated, not fitted.
+//      - a category-matched fit (excluding CEX / bridges / liquid staking, n = 94) was
+//        REJECTED: R2 fell to 0.10 and leave-one-out error rose to 3.65x. The anchor is
+//        market-wide, and the fit says so.
+//
+// 4. Unknown age earns no maturity credit. The old model substituted 365 days when listed_at
+//    was missing (113 of 758 protocols), which invented a year of track record for protocols
+//    whose age is simply unknown. Now age is 0 for the maturity computation when listed_at
+//    is absent; age_days stays null in the output so the dashboard shows "unknown".
+//
+// 5. The change evidence is graded, not a cliff. The old SOURCE_QUALITY gave its 0.10 bonus
+//    in full at |change| <= 200% and nothing at 201% — a one-point jump for a one-point move.
+//    Now the bonus is full up to 200% and fades linearly to 0 at 400%.
+//
+// 6. The spike flag is renamed 'volume-spike' -> 'tvl-spike': its trigger is a 7-day TVL
+//    rise of 100% or more, and the snapshot carries no volume figure at all.
+//
+// 7. Duplicate slugs are deduped openly. The old code built a Map that silently overwrote
+//    the earlier record. Now the highest-TVL record wins (ties: earliest listed date, then
+//    first in snapshot order) and every duplicate is reported in lastBuildStats.
+//
+// 8. The board tie-break is implied value, then TVL, then slug, and ties on implied value
+//    are counted in lastBuildStats instead of hiding behind the slug order.
 //
 // The score then scales the implied value and sets the row's tier (V6's thresholds verbatim):
 // DISCARD below 0.45, DISTRIBUTE from 0.45, PRIORITY from 0.75. A DISCARD row is still
 // ranked — the gate requires every watchlist slug on the board — but the dashboard marks it
 // "watch only" and its farm plan says so.
 //
-//   implied = round( tvl_usd x 0.25 x growthMult x maturityMult x scoreBoost )
+//   implied = round( compsValue x growthMult x maturityMult x scoreBoost )
+//   compsValue   = exp(6.9646) x tvl^0.5223, multiple clamped to [0.01, 1.0]
 //   growthMult   = 1 + clamp(change_7d, -60, 120) / 100 x 0.5
-//   maturityMult = 0.6 + min(age_days, 1095) / 1095 x 0.4   (unknown age: 365 days)
+//   maturityMult = 0.6 + min(age_days or 0, 1095) / 1095 x 0.4
 //   scoreBoost   = 0.6 + 0.8 x score
 //
 // Risk flags come from V6's two-layer anti-rug screener and DEX scanner, adapted to what the
 // snapshot can see: a 7-day fall of 30% or more is a LIQUIDITY_DRAIN watch (V6 fires CRITICAL
-// at a >= 30% drain, TTL 5 minutes); a 7-day rise of 100% or more is a VOLUME_SPIKE flag
-// (V6's >= 4x baseline spike); a protocol younger than 90 days with under $100M TVL is a
-// NEW_LAUNCH flag (V6's NEW_TOKEN_LAUNCH type). Flags never remove a row; they are shown.
+// at a >= 30% drain, TTL 5 minutes); a 7-day rise of 100% or more is a TVL_SPIKE flag
+// (V6's >= 4x baseline spike, here on TVL because the snapshot has no volume); a protocol
+// younger than 90 days with under $100M TVL is a NEW_LAUNCH flag (V6's NEW_TOKEN_LAUNCH type).
+// Flags never remove a row; they are shown.
 //
 // Discovery borrows the shape of CloddsBot's pump.fun skill (read as reference only): rank
 // candidates the way pump.fun surfaces tokens — trending by volume, gainers by change,
@@ -88,12 +120,17 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** The V6 engine's weights and thresholds, verbatim from v6_signal_processor.py. */
+/**
+ * The V6 engine's weights and thresholds. The weights are V6's, renormalized over the three
+ * components a single sealed snapshot can measure: cross-validation holds 0 (see the header),
+ * so its 0.25 is shared out — 0.30/0.75, 0.25/0.75, 0.20/0.75 — and the weights still sum to
+ * 1. Thresholds are V6's verbatim.
+ */
 export const V6 = {
-  wSource: 0.3,
-  wWallet: 0.25,
-  wStrength: 0.2,
-  wCross: 0.25,
+  wSource: 0.4,
+  wMaturity: 1 / 3,
+  wStrength: 4 / 15,
+  wCross: 0,
   noiseThreshold: 0.45,
   priorityThreshold: 0.75,
   drainPct: -30,
@@ -102,16 +139,23 @@ export const V6 = {
   newLaunchMaxTvl: 100_000_000,
 } as const;
 
-/** The radar's own constants, stated in the dashboard so the judge can recompute any row. */
+/**
+ * The radar's own constants, stated in the dashboard so the judge can recompute any row.
+ * compsIntercept / compsSlope are the log-log fit of market cap on TVL across the 128
+ * live-token protocols of this snapshot (tools/fit-comps.mjs reproduces them); priorBase is
+ * a heuristic baseline, not a calibrated Bayesian prior.
+ */
 export const MODEL = {
-  baseMultiple: 0.25,
+  compsIntercept: 6.9646,
+  compsSlope: 0.5223,
+  compsMultipleMin: 0.01,
+  compsMultipleMax: 1.0,
   growthWeight: 0.5,
   growthFloor: -60,
   growthCap: 120,
   maturityFloor: 0.6,
   maturityRange: 0.4,
   maturityDays: 1095,
-  unknownAgeDays: 365,
   scoreBoostFloor: 0.6,
   scoreBoostRange: 0.8,
   priorBase: 0.55,
@@ -119,9 +163,11 @@ export const MODEL = {
   priorChange: 0.1,
   priorCategory: 0.1,
   priorChains: 0.1,
+  changeSaneMax: 200,
+  changeSaneFade: 400,
 } as const;
 
-export const MODEL_VERSION = 'radar-v6-1';
+export const MODEL_VERSION = 'radar-v6-2';
 
 /** Pre-token protocols below the watchlist floor carried by the early radar, by TVL. */
 export const EARLY_ROWS = 180;
@@ -156,14 +202,14 @@ export interface BoardRow {
   v6_tier: 'DISCARD' | 'DISTRIBUTE' | 'PRIORITY';
   v6: {
     source_quality: number;
-    wallet_reputation: number;
+    maturity_scale: number;
     signal_strength: number;
     cross_validation: number;
     evidence_count: number;
   };
   risk_flags: string[];
   model: {
-    base_multiple: number;
+    comps_value: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -227,6 +273,14 @@ export class SnapshotError extends Error {
   }
 }
 
+/** What the last buildBoard call found while deduping and sorting: read by main.ts and tests. */
+export interface BuildStats {
+  duplicates: number;
+  duplicateWarnings: string[];
+  impliedTies: number;
+}
+export let lastBuildStats: BuildStats = { duplicates: 0, duplicateWarnings: [], impliedTies: 0 };
+
 const DAY_MS = 86_400_000;
 const clamp01 = (n: number): number => Math.min(1, Math.max(0, n));
 const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
@@ -259,50 +313,106 @@ export function isRankable(p: SnapshotProtocol): boolean {
   return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
 }
 
-/** The four V6 components for one protocol, each in [0, 1], plus the evidence count. */
+/**
+ * Dedupe by slug, openly: the highest-TVL record wins; ties go to the earliest listed date,
+ * then to the first record in snapshot order. Every duplicate is reported so a silent
+ * overwrite can never shift the ranking again. The snapshot itself carries no duplicates
+ * (758 protocols, 758 slugs); this is a guard for any snapshot that does.
+ */
+export function dedupeProtocols(protocols: SnapshotProtocol[]): { unique: SnapshotProtocol[]; warnings: string[] } {
+  const best = new Map<string, SnapshotProtocol>();
+  const warnings: string[] = [];
+  for (const p of protocols) {
+    const prev = best.get(p.slug);
+    if (prev === undefined) {
+      best.set(p.slug, p);
+      continue;
+    }
+    const prevDate = prev.listed_at ?? '9999-99-99';
+    const pDate = p.listed_at ?? '9999-99-99';
+    const keepNew = p.tvl_usd > prev.tvl_usd || (p.tvl_usd === prev.tvl_usd && pDate < prevDate);
+    const kept = keepNew ? p : prev;
+    const dropped = keepNew ? prev : p;
+    warnings.push(
+      `duplicate slug ${p.slug}: kept $${kept.tvl_usd.toLocaleString('en-US')} TVL` +
+        ` (listed ${kept.listed_at ?? 'unknown'}), dropped $${dropped.tvl_usd.toLocaleString('en-US')} TVL` +
+        ` (listed ${dropped.listed_at ?? 'unknown'})`,
+    );
+    if (keepNew) best.set(p.slug, p);
+  }
+  return { unique: [...best.values()], warnings };
+}
+
+/**
+ * The comps value: what the live-token market pays for this much TVL, fitted on this
+ * snapshot (ln(mcap) = 6.9646 + 0.5223 * ln(tvl), n = 128). The multiple falls smoothly
+ * with size and is clamped to [0.01, 1.0] so the largest protocols cannot collapse to zero.
+ */
+export function compsValue(tvlUsd: number): number {
+  const fitted = Math.exp(MODEL.compsIntercept) * Math.pow(Math.max(tvlUsd, 1), MODEL.compsSlope);
+  const multiple = clamp(fitted / Math.max(tvlUsd, 1), MODEL.compsMultipleMin, MODEL.compsMultipleMax);
+  return Math.max(1, tvlUsd * multiple);
+}
+
+/** The V6 components for one protocol, each in [0, 1], plus the evidence count. */
 export function v6Components(p: SnapshotProtocol, asOf: string, maxTvl: number): {
   sourceQuality: number;
-  walletReputation: number;
+  maturityScale: number;
   signalStrength: number;
   crossValidation: number;
   evidenceCount: number;
   age: number | null;
 } {
   const age = ageDays(asOf, p.listed_at);
-  // SOURCE_QUALITY: record completeness on a Bayesian prior (base 0.55, Birdeye's prior).
-  // A field earns its bonus only when it is informative: a listing date needs 180 days of
-  // track record behind it, a 7-day change needs to be sane (|change| <= 200%), and a
-  // chain count needs to show genuine multi-chain deployment (3+ chains).
+  // SOURCE_QUALITY: record completeness on a heuristic baseline of 0.55 — a stated starting
+  // point, not a calibrated Bayesian prior. A field earns its bonus only when it is
+  // informative: a listing date needs 180 days of track record behind it; a named category
+  // and 3+ chains are presence facts; a 7-day change earns its bonus in full while it is
+  // sane (|change| <= 200%) and fades linearly to nothing at 400%, so a 199% print and a
+  // 201% print no longer score a full step apart.
   const hasTrackRecord = p.listed_at !== null && age !== null && age >= 180;
-  const hasSaneChange = p.change_7d !== null && Math.abs(p.change_7d) <= 200;
+  const changeAbs = p.change_7d === null ? null : Math.abs(p.change_7d);
+  const changeWeight =
+    changeAbs === null
+      ? 0
+      : changeAbs <= MODEL.changeSaneMax
+        ? 1
+        : Math.max(0, 1 - (changeAbs - MODEL.changeSaneMax) / (MODEL.changeSaneFade - MODEL.changeSaneMax));
   const hasCategory = p.category !== null;
   const hasWideChains = p.chains.length >= 3;
   let sourceQuality = MODEL.priorBase;
   if (hasTrackRecord) sourceQuality += MODEL.priorListed;
-  if (hasSaneChange) sourceQuality += MODEL.priorChange;
+  sourceQuality += changeWeight * MODEL.priorChange;
   if (hasCategory) sourceQuality += MODEL.priorCategory;
   if (hasWideChains) sourceQuality += MODEL.priorChains;
   sourceQuality = clamp01(sourceQuality);
-  // WALLET_REPUTATION: maturity (half) and scale (half, log TVL from the $5M floor).
-  const ageForModel = age ?? MODEL.unknownAgeDays;
+  // MATURITY_SCALE (was WALLET_REPUTATION — it never measured a wallet): half maturity and
+  // half scale. Maturity is the age capped at 1095 days; an unknown age earns NO maturity
+  // credit (0 days), because an unrecorded listing date is not a year of track record.
+  // Scale is log TVL between the $5M snapshot floor and the largest protocol.
+  const ageForModel = age ?? 0;
   const maturity = clamp(ageForModel / MODEL.maturityDays, 0, 1);
   const scale = clamp(Math.log(Math.max(p.tvl_usd, 1) / 5_000_000) / Math.log(Math.max(maxTvl, 5_000_001) / 5_000_000), 0, 1);
-  const walletReputation = 0.5 * maturity + 0.5 * scale;
+  const maturityScale = 0.5 * maturity + 0.5 * scale;
   // SIGNAL_STRENGTH: clamped 7-day change mapped onto [0, 1].
   const growthPct = clamp(finite(p.change_7d, 0), MODEL.growthFloor, MODEL.growthCap);
   const signalStrength = (growthPct - MODEL.growthFloor) / (MODEL.growthCap - MODEL.growthFloor);
-  // CROSS_VALIDATION: V6's step function over four independent fields of the record.
+  // CROSS_VALIDATION: 0. The snapshot is one sealed cross-section; the four fields that
+  // would "confirm" a record are the same fields SOURCE_QUALITY already counted, so
+  // counting them again would double-count the evidence. The evidence count is still
+  // reported, so the record's completeness stays visible — it just earns no confirmation
+  // bonus until an outside source confirms the protocol.
   const evidenceCount =
-    (hasTrackRecord ? 1 : 0) + (hasSaneChange ? 1 : 0) + (hasCategory ? 1 : 0) + (hasWideChains ? 1 : 0);
-  const crossValidation = evidenceCount <= 1 ? 0 : evidenceCount === 2 ? 0.6 : 1;
-  return { sourceQuality, walletReputation, signalStrength, crossValidation, evidenceCount, age };
+    (hasTrackRecord ? 1 : 0) + (changeWeight > 0 ? 1 : 0) + (hasCategory ? 1 : 0) + (hasWideChains ? 1 : 0);
+  const crossValidation = 0;
+  return { sourceQuality, maturityScale, signalStrength, crossValidation, evidenceCount, age };
 }
 
-/** The V6 score: the weighted sum, rounded like the engine's `round(..., 4)`. */
-export function v6Score(c: { sourceQuality: number; walletReputation: number; signalStrength: number; crossValidation: number }): number {
+/** The V6 score: the weighted sum over the measurable components, rounded like the engine's `round(..., 4)`. */
+export function v6Score(c: { sourceQuality: number; maturityScale: number; signalStrength: number; crossValidation: number }): number {
   const total =
     c.sourceQuality * V6.wSource +
-    c.walletReputation * V6.wWallet +
+    c.maturityScale * V6.wMaturity +
     c.signalStrength * V6.wStrength +
     c.crossValidation * V6.wCross;
   return round4(clamp(total, 0, 1));
@@ -320,7 +430,7 @@ export function riskFlags(p: SnapshotProtocol, age: number | null): string[] {
   const flags: string[] = [];
   const change = p.change_7d;
   if (change !== null && change <= V6.drainPct) flags.push('drain-watch');
-  if (change !== null && change >= V6.spikePct) flags.push('volume-spike');
+  if (change !== null && change >= V6.spikePct) flags.push('tvl-spike');
   if (age !== null && age <= V6.newLaunchMaxAge && p.tvl_usd <= V6.newLaunchMaxTvl) flags.push('new-launch');
   return flags;
 }
@@ -331,6 +441,7 @@ export function impliedValue(p: SnapshotProtocol, asOf: string, maxTvl: number):
   score: number;
   tier: 'DISCARD' | 'DISTRIBUTE' | 'PRIORITY';
   components: ReturnType<typeof v6Components>;
+  comps: number;
   growthPct: number;
   growthMult: number;
   maturityMult: number;
@@ -340,25 +451,22 @@ export function impliedValue(p: SnapshotProtocol, asOf: string, maxTvl: number):
   const components = v6Components(p, asOf, maxTvl);
   const score = v6Score(components);
   const tier = v6Tier(score);
+  const comps = compsValue(p.tvl_usd);
   const growthPct = clamp(finite(p.change_7d, 0), MODEL.growthFloor, MODEL.growthCap);
   const growthMult = 1 + (growthPct / 100) * MODEL.growthWeight;
-  const ageForModel = components.age ?? MODEL.unknownAgeDays;
+  const ageForModel = components.age ?? 0;
   const maturityMult =
     MODEL.maturityFloor + (Math.min(Math.max(ageForModel, 0), MODEL.maturityDays) / MODEL.maturityDays) * MODEL.maturityRange;
   const scoreBoost = MODEL.scoreBoostFloor + MODEL.scoreBoostRange * score;
-  const implied = Math.max(1, Math.round(p.tvl_usd * MODEL.baseMultiple * growthMult * maturityMult * scoreBoost));
-  return { implied, score, tier, components, growthPct, growthMult, maturityMult, scoreBoost, age: components.age };
-}
-
-/** The snapshot's protocol by slug. */
-function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
-  return new Map(protocols.map((p) => [p.slug, p]));
+  const implied = Math.max(1, Math.round(comps * growthMult * maturityMult * scoreBoost));
+  return { implied, score, tier, components, comps, growthPct, growthMult, maturityMult, scoreBoost, age: components.age };
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot): BoardRow[] {
-  const index = bySlug(snapshot.protocols);
-  const maxTvl = Math.max(...snapshot.protocols.map((p) => p.tvl_usd), 5_000_001);
+  const { unique, warnings } = dedupeProtocols(snapshot.protocols);
+  const index = new Map(unique.map((p) => [p.slug, p]));
+  const maxTvl = Math.max(...unique.map((p) => p.tvl_usd), 5_000_001);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug it names is ranked, whatever its score.
   for (const slug of snapshot.watchlist) {
@@ -367,14 +475,22 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
   }
   // The early radar: pre-token protocols below the watchlist floor, by TVL, capped.
   // Like CloddsBot's new-hot list, this is where the radar finds launches before the crowd.
-  const early = snapshot.protocols
+  const early = unique
     .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
     .slice(0, EARLY_ROWS);
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => ({ p, ...impliedValue(p, snapshot.as_of, maxTvl) }));
-  scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  // Implied value first, then TVL, then slug: a tie on value is broken by size, and only a
+  // tie on both falls back to the slug order. Ties are counted, not hidden.
+  scored.sort(
+    (a, b) =>
+      b.implied - a.implied || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0),
+  );
+  let impliedTies = 0;
+  for (let i = 1; i < scored.length; i++) if (scored[i]!.implied === scored[i - 1]!.implied) impliedTies++;
+  lastBuildStats = { duplicates: warnings.length, duplicateWarnings: warnings, impliedTies };
   return scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
@@ -394,14 +510,14 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
     v6_tier: s.tier,
     v6: {
       source_quality: round4(s.components.sourceQuality),
-      wallet_reputation: round4(s.components.walletReputation),
+      maturity_scale: round4(s.components.maturityScale),
       signal_strength: round4(s.components.signalStrength),
       cross_validation: round4(s.components.crossValidation),
       evidence_count: s.components.evidenceCount,
     },
     risk_flags: riskFlags(s.p, s.age),
     model: {
-      base_multiple: MODEL.baseMultiple,
+      comps_value: Math.round(s.comps),
       growth_pct: round4(s.growthPct),
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -441,6 +557,49 @@ function holdDaysFor(age: number | null): number {
   return 30;
 }
 
+/**
+ * Rough cost of one simple transaction on a chain, in whole dollars, from public fee
+ * trackers — an estimate, never a measured quote: fees move with congestion, and a chain
+ * not listed here uses $2. The farm plan states the figure is rough and names the chain,
+ * so a reader can check the chain's own fee tracker before depositing.
+ */
+const GAS_USD: Record<string, number> = {
+  Ethereum: 5,
+  Arbitrum: 0.5,
+  Optimism: 0.5,
+  Base: 0.2,
+  Binance: 0.3,
+  Solana: 0.01,
+  Avalanche: 0.5,
+  Polygon: 0.1,
+  Tron: 0.5,
+  Linea: 0.3,
+  'zkSync Era': 0.3,
+  Sui: 0.01,
+  Fantom: 0.2,
+  Sonic: 0.1,
+  Mantle: 0.2,
+  Scroll: 0.3,
+  Berachain: 0.1,
+  Celo: 0.1,
+  xDai: 0.05,
+  'Hyperliquid L1': 0.01,
+  Monad: 0.01,
+  Unichain: 0.2,
+  Sei: 0.01,
+  TON: 0.05,
+  Cardano: 0.2,
+  Ripple: 0.01,
+};
+export function gasUsd(chain: string): number {
+  return GAS_USD[chain] ?? 2;
+}
+
+/** A dollar figure with no trailing zeros, for the farm plan's cost strings. */
+function fmtGas(n: number): string {
+  return n % 1 === 0 ? String(n) : n.toFixed(2).replace(/0$/, '');
+}
+
 /** The category's one action, in words a farmer can follow. */
 function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
@@ -461,16 +620,20 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
 }
 
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time, derived from the
- * protocol's own record (category, chains, TVL, age, V6 tier) — never from a hand-written list
- * of names. The discovery step mirrors CloddsBot's pump.fun watch: check the protocol's new
- * pools and vaults the way a launch radar watches new-hot tokens, and the risk step mirrors
- * V6's wash-trading and drain checks: a sharp TVL fall means pause, not chase.
+ * A protocol's farm plan: eight steps, each an action with a cost and a time, derived from
+ * the protocol's own record (category, chains, TVL, age, V6 tier) — never from a hand-written
+ * list of names. The discovery step mirrors CloddsBot's pump.fun watch: check the
+ * protocol's new pools and vaults the way a launch radar watches new-hot tokens, and the
+ * risk step mirrors V6's wash-trading and drain checks: a sharp TVL fall means pause, not
+ * chase. Gas is a rough per-chain estimate (see gasUsd); capital is a heuristic from TVL;
+ * the last step says so in plain words, and no step claims the protocol runs a farming or
+ * points program — that has to be confirmed on its own site.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null, tier: 'DISCARD' | 'DISTRIBUTE' | 'PRIORITY'): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const gas = fmtGas(gasUsd(chain));
   const action = actionFor(p, capital, chain);
   const tierNote =
     tier === 'PRIORITY'
@@ -481,22 +644,22 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, tier: 'DISCAR
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper. ${tierNote}`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: `about $${gas} of gas for the first transaction`,
       time: '5 minutes',
     },
     {
       text: action,
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and about $${gas} of gas`,
       time: '15 minutes to set up',
     },
     {
       text: `Do one qualifying action each week on ${chain} — a deposit, a borrow, a swap or a vote — and keep a different action each week so the pattern looks like real use.`,
-      cost: 'about $2 of gas a week',
+      cost: `about $${gas} of gas a week`,
       time: '10 minutes a week',
     },
     {
       text: `Once a week, check ${p.name} for newly added pools, vaults or markets and use the newest one once with $10, the way a launch radar watches new-hot listings.`,
-      cost: '$10 of capital and about $2 of gas',
+      cost: `$10 of capital and about $${gas} of gas`,
       time: '10 minutes a week',
     },
     {
@@ -514,12 +677,18 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, tier: 'DISCAR
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
     },
+    {
+      text: `Treat every figure in this plan as an estimate from the protocol's TVL and its first chain: the $${capital} capital is a heuristic, the $${gas} gas is a rough public figure for ${chain}, and nobody here checked whether ${p.name} runs a farming or points program — confirm that on its own site before you deposit.`,
+      cost: 'nothing to check',
+      time: '10 minutes',
+    },
   ];
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
-  return snapshot.protocols
+  const { unique } = dedupeProtocols(snapshot.protocols);
+  return unique
     .filter((p) => !isPreToken(p) && p.category !== 'CEX')
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
     .slice(0, LIVE_ROWS)
@@ -564,7 +733,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   // The page recomputes each row's V6 score, so it needs the same scale denominator the
   // model used: the largest TVL in the whole snapshot, not just on the board.
-  const maxTvl = Math.max(...snapshot.protocols.map((p) => p.tvl_usd), 5_000_001);
+  const { unique } = dedupeProtocols(snapshot.protocols);
+  const maxTvl = Math.max(...unique.map((p) => p.tvl_usd), 5_000_001);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     floor_usd: snapshot.floor_usd,

@@ -16,7 +16,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, dataScript, lastBuildStats, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -98,8 +98,12 @@ if (boardOnDisk.rows.some((r: { slug: string; implied_value_usd: number }, i: nu
 
 const tiers = { PRIORITY: 0, DISTRIBUTE: 0, DISCARD: 0 };
 for (const row of board) tiers[row.v6_tier]++;
+if (lastBuildStats.duplicates > 0) {
+  for (const w of lastBuildStats.duplicateWarnings) process.stderr.write(`token radar: ${w}\n`);
+}
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
     `token radar: V6 tiers — ${tiers.PRIORITY} PRIORITY, ${tiers.DISTRIBUTE} DISTRIBUTE, ${tiers.DISCARD} DISCARD\n` +
+    `token radar: ${lastBuildStats.duplicates} duplicate slug(s) deduped, ${lastBuildStats.impliedTies} implied-value tie(s) broken by TVL then slug\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')} (${dossier.length} bytes, self-check passed)\n`,
 );

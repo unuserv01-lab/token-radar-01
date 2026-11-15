@@ -37,38 +37,55 @@
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
 
   // The V6 score, recomputed in the page from the snapshot figures, so the page's code and
-  // board.json visibly agree. Same weights and thresholds as lib/model.ts:
-  // score = source*0.30 + reputation*0.25 + strength*0.20 + cross*0.25.
+  // board.json visibly agree. Same weights and thresholds as lib/model.ts: the cross-validation
+  // weight is redistributed over the three measurable components (0.40 / 1/3 / 4/15), because
+  // one sealed snapshot carries no independent confirmation and cross-validation is 0.
+  // score = source*0.40 + maturity*(1/3) + strength*(4/15) + cross*0.
   function v6Of(row, maxTvl) {
     // A field counts only when it is informative: a listing date needs 180 days of track
-    // record, a 7-day change needs to be sane (|change| <= 200%), chains need 3+.
+    // record, chains need 3+, and a 7-day change earns its bonus in full while sane
+    // (|change| <= 200%) and fading linearly to nothing at 400%.
     var trackRecord = row.listed_at !== null && row.age_days !== null && row.age_days >= 180;
-    var saneChange = row.change_7d !== null && Math.abs(row.change_7d) <= 200;
+    var changeAbs = row.change_7d === null ? null : Math.abs(row.change_7d);
+    var changeWeight = changeAbs === null ? 0 : changeAbs <= 200 ? 1 : Math.max(0, 1 - (changeAbs - 200) / 200);
     var sq = 0.55;
     if (trackRecord) sq += 0.15;
-    if (saneChange) sq += 0.10;
+    sq += changeWeight * 0.10;
     if (row.category !== null) sq += 0.10;
     if (row.chains && row.chains.length >= 3) sq += 0.10;
     sq = clamp(sq, 0, 1);
-    var age = row.age_days === null || row.age_days === undefined ? 365 : row.age_days;
+    // Unknown age earns no maturity credit: an unrecorded listing date is not a year of
+    // track record.
+    var age = row.age_days === null || row.age_days === undefined ? 0 : row.age_days;
     var maturity = clamp(age / 1095, 0, 1);
     var scale = clamp(Math.log(Math.max(row.tvl_usd, 1) / 5e6) / Math.log(Math.max(maxTvl, 5000001) / 5e6), 0, 1);
-    var rep = 0.5 * maturity + 0.5 * scale;
+    var maturityScale = 0.5 * maturity + 0.5 * scale;
     var growth = clamp(row.change_7d === null ? 0 : row.change_7d, -60, 120);
     var strength = (growth + 60) / 180;
-    var evidence = (trackRecord ? 1 : 0) + (saneChange ? 1 : 0) + (row.category !== null ? 1 : 0) + (row.chains && row.chains.length >= 3 ? 1 : 0);
-    var cross = evidence <= 1 ? 0 : evidence === 2 ? 0.6 : 1;
-    var score = Math.round((sq * 0.3 + rep * 0.25 + strength * 0.2 + cross * 0.25) * 1e4) / 1e4;
-    return { source: sq, reputation: rep, strength: strength, cross: cross, evidence: evidence, score: score };
+    // Cross-validation is 0: the four fields that would "confirm" a record are the same
+    // fields source quality already counted. The evidence count is still shown.
+    var evidence = (trackRecord ? 1 : 0) + (changeWeight > 0 ? 1 : 0) + (row.category !== null ? 1 : 0) + (row.chains && row.chains.length >= 3 ? 1 : 0);
+    var cross = 0;
+    var score = Math.round((sq * 0.4 + maturityScale * (1 / 3) + strength * (4 / 15) + cross * 0) * 1e4) / 1e4;
+    return { source: sq, maturity: maturityScale, strength: strength, cross: cross, evidence: evidence, score: score };
+  }
+  // The comps value: what the live-token market pays for this much TVL, fitted on this
+  // snapshot (ln(mcap) = 6.9646 + 0.5223 * ln(tvl), 128 live-token protocols). The multiple
+  // falls smoothly with size and is clamped to [0.01, 1.0].
+  function compsOf(row) {
+    var fitted = Math.exp(6.9646) * Math.pow(Math.max(row.tvl_usd, 1), 0.5223);
+    var multiple = clamp(fitted / Math.max(row.tvl_usd, 1), 0.01, 1.0);
+    return Math.max(1, row.tvl_usd * multiple);
   }
   function impliedOf(row, maxTvl) {
     var v = v6Of(row, maxTvl);
+    var comps = compsOf(row);
     var growth = clamp(row.change_7d === null ? 0 : row.change_7d, -60, 120);
     var growthMult = 1 + (growth / 100) * 0.5;
-    var age = row.age_days === null || row.age_days === undefined ? 365 : row.age_days;
+    var age = row.age_days === null || row.age_days === undefined ? 0 : row.age_days;
     var maturityMult = 0.6 + (Math.min(Math.max(age, 0), 1095) / 1095) * 0.4;
     var boost = 0.6 + 0.8 * v.score;
-    return { implied: Math.max(1, Math.round(row.tvl_usd * 0.25 * growthMult * maturityMult * boost)), v6: v, growthMult: growthMult, maturityMult: maturityMult, boost: boost };
+    return { implied: Math.max(1, Math.round(comps * growthMult * maturityMult * boost)), v6: v, comps: comps, growthMult: growthMult, maturityMult: maturityMult, boost: boost };
   }
   function maxTvl() { return DATA.max_tvl_usd || Math.max.apply(null, DATA.rows.map(function (r) { return r.tvl_usd; })); }
 
@@ -131,28 +148,40 @@
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
+  // Rough cost of one simple transaction on a chain, in dollars, from public fee trackers —
+  // an estimate, never a measured quote. A chain not listed here uses $2.
+  var GAS_USD = { Ethereum: 5, Arbitrum: 0.5, Optimism: 0.5, Base: 0.2, Binance: 0.3, Solana: 0.01, Avalanche: 0.5, Polygon: 0.1, Tron: 0.5, Linea: 0.3, 'zkSync Era': 0.3, Sui: 0.01, Fantom: 0.2, Sonic: 0.1, Mantle: 0.2, Scroll: 0.3, Berachain: 0.1, Celo: 0.1, xDai: 0.05, 'Hyperliquid L1': 0.01, Monad: 0.01, Unichain: 0.2, Sei: 0.01, TON: 0.05, Cardano: 0.2, Ripple: 0.01 };
+  function gasUsd(chain) { return GAS_USD[chain] === undefined ? 2 : GAS_USD[chain]; }
+  function fmtGas(n) { return n % 1 === 0 ? String(n) : n.toFixed(2).replace(/0$/, ''); }
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
+    var gas = fmtGas(gasUsd(chain));
     var tierNote = p.v6_tier === 'PRIORITY'
       ? 'This is a PRIORITY row (V6 score 0.75 or higher): farm it first.'
       : p.v6_tier === 'DISTRIBUTE'
         ? 'This is a DISTRIBUTE row (V6 score 0.45 to 0.75): worth a standard position.'
         : 'This is a DISCARD row (V6 score under 0.45): watch only, put no fresh capital in until its score rises.';
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper. ' + tierNote, cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
-      { text: 'Do one qualifying action each week on ' + chain + ' — a deposit, a borrow, a swap or a vote — and keep a different action each week so the pattern looks like real use.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
-      { text: 'Once a week, check ' + p.name + ' for newly added pools, vaults or markets and use the newest one once with $10, the way a launch radar watches new-hot listings.', cost: '$10 of capital and about $2 of gas', time: '10 minutes a week' },
+      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper. ' + tierNote, cost: 'about $' + gas + ' of gas for the first transaction', time: '5 minutes' },
+      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + gas + ' of gas', time: '15 minutes to set up' },
+      { text: 'Do one qualifying action each week on ' + chain + ' — a deposit, a borrow, a swap or a vote — and keep a different action each week so the pattern looks like real use.', cost: 'about $' + gas + ' of gas a week', time: '10 minutes a week' },
+      { text: 'Once a week, check ' + p.name + ' for newly added pools, vaults or markets and use the newest one once with $10, the way a launch radar watches new-hot listings.', cost: '$10 of capital and about $' + gas + ' of gas', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot, and do not withdraw and re-deposit to game the count.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: "If the protocol's TVL falls 30% in a week, pause new deposits and check its own announcements first — a drain that steep is a V6 liquidity-drain watch, not a buying signal.", cost: 'nothing to check', time: '5 minutes a week' },
-      { text: "Before you withdraw, open the protocol's own points or rewards page from its official site and claim only from the link it publishes; never pay anyone to claim for you.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' }
+      { text: "Before you withdraw, open the protocol's own points or rewards page from its official site and claim only from the link it publishes; never pay anyone to claim for you.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+      { text: 'Treat every figure in this plan as an estimate from the protocol\'s TVL and its first chain: the $' + capital + ' capital is a heuristic, the $' + gas + ' gas is a rough public figure for ' + chain + ', and nobody here checked whether ' + p.name + ' runs a farming or points program — confirm that on its own site before you deposit.', cost: 'nothing to check', time: '10 minutes' }
     ].map(stepText);
   }
 
   // ---- hash routing -------------------------------------------------------
   function readHash() {
+    // The hash fully describes the view, so start from the defaults every time: a
+    // hashchange from a detail view to a filtered view must not keep the old selection
+    // (and its dialog) open behind the new view.
+    state.q = ''; state.category = 'all'; state.tier = 'all'; state.minTvl = 0;
+    state.tab = 'pre-token'; state.selected = null; state.preset = false;
     var raw = window.location.hash.replace(/^#/, '');
     if (!raw || raw === '/') return;
     if (raw === '/filtered') {
@@ -366,11 +395,12 @@
   function modelPanel() {
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures, adapted from Sigma On-Chain V6: score = source_quality x 0.30 + wallet_reputation x 0.25 + signal_strength x 0.20 + cross_validation x 0.25. Source quality is record completeness; reputation is age and TVL scale; strength is the clamped 7-day change; cross-validation counts the independent fields that confirm the record (1 field: 0.0, 2: 0.6, 3 or more: 1.0). No protocol name is special-cased.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures, adapted from Sigma On-Chain V6: score = source_quality x 0.40 + maturity_scale x 0.33 + signal_strength x 0.27 + cross_validation x 0. Cross-validation is 0 — one sealed snapshot carries no independent confirmation, so its weight is shared over the three components the snapshot can measure. Source quality is record completeness on a stated 0.55 baseline (a heuristic, not a calibrated prior); maturity and scale is half age, half log-TVL; strength is the clamped 7-day change. No protocol name is special-cased.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x 0.25 x (1 + clamp(change_7d, -60, 120) / 100 x 0.5) x (0.6 + min(age_days, 1095) / 1095 x 0.4) x (0.6 + 0.8 x v6_score) )'
+        'implied = round( compsValue x (1 + clamp(change_7d, -60, 120) / 100 x 0.5) x (0.6 + min(age_days or 0, 1095) / 1095 x 0.4) x (0.6 + 0.8 x v6_score) )'
       ),
-      el('p', { class: 'sub', text: 'Tiers use V6 thresholds: under 0.45 DISCARD (watch only), 0.45 to 0.75 DISTRIBUTE, 0.75 and up PRIORITY. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses 365 days. Risk flags: a 7-day fall of 30% or more is a drain watch, a rise of 100% or more a volume spike, and a protocol under 90 days old with under $100M TVL a new launch. This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'compsValue is fitted, not guessed: ln(market cap) = 6.9646 + 0.5223 x ln(TVL) across the 128 live-token protocols in this snapshot (R2 0.19; leave-one-out median error 3.4x, against 4.9x for a flat 0.25 multiple). The multiple falls smoothly with size — 0.67x at $5M TVL, 0.13x at $154M, 0.05x at $1B — and is clamped to [0.01, 1.0]. The fit anchors the level; it never pretends to price one protocol precisely.' }),
+      el('p', { class: 'sub', text: 'Tiers use V6 thresholds: under 0.45 DISCARD (watch only), 0.45 to 0.75 DISTRIBUTE, 0.75 and up PRIORITY. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age earns no maturity credit and shows as unknown. A 7-day change earns its source-quality bonus in full while sane (within 200%) and fading to nothing at 400%. Risk flags: a 7-day fall of 30% or more is a drain watch, a rise of 100% or more a TVL spike, and a protocol under 90 days old with under $100M TVL a new launch. Farm plans carry a rough per-chain gas figure and a last step stating the plan\u2019s limits. This is an estimate, not a price.' })
     );
   }
 
@@ -401,10 +431,11 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Source quality (x0.30)' }), el('b', { class: 'num', text: String(calc.v6.source.toFixed(2)) })),
-        el('div', null, el('span', { text: 'Reputation (x0.25)' }), el('b', { class: 'num', text: String(calc.v6.reputation.toFixed(2)) })),
-        el('div', null, el('span', { text: 'Signal strength (x0.20)' }), el('b', { class: 'num', text: String(calc.v6.strength.toFixed(2)) })),
-        el('div', null, el('span', { text: 'Cross-validation (x0.25)' }), el('b', { class: 'num', text: String(calc.v6.cross.toFixed(2)) + ' · ' + calc.v6.evidence + ' fields' })),
+        el('div', null, el('span', { text: 'Comps value (fitted)' }), el('b', { class: 'num', text: fmtUsd(calc.comps) })),
+        el('div', null, el('span', { text: 'Source quality (x0.40)' }), el('b', { class: 'num', text: String(calc.v6.source.toFixed(2)) })),
+        el('div', null, el('span', { text: 'Maturity & scale (x0.33)' }), el('b', { class: 'num', text: String(calc.v6.maturity.toFixed(2)) })),
+        el('div', null, el('span', { text: 'Signal strength (x0.27)' }), el('b', { class: 'num', text: String(calc.v6.strength.toFixed(2)) })),
+        el('div', null, el('span', { text: 'Cross-validation (x0.00)' }), el('b', { class: 'num', text: String(calc.v6.cross.toFixed(2)) + ' · ' + calc.v6.evidence + ' fields, no independent source' })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(calc.implied) + (calc.implied === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + (row.risk_flags && row.risk_flags.length ? ' Risk flags: ' + row.risk_flags.join(', ') + '.' : ' No risk flags.') + ' This is an estimate, not a price.' })
@@ -440,6 +471,7 @@
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
     if (state.selected) openDetail(state.selected);
+    else if (dialog.open) dialog.close();
   }
 
   readHash();
